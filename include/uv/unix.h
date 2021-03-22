@@ -69,6 +69,8 @@
 # include "uv/posix.h"
 #elif defined(__HAIKU__)
 # include "uv/posix.h"
+#elif defined(__QNX__)
+# include "uv/posix.h"
 #endif
 
 #ifndef NI_MAXHOST
@@ -226,7 +228,7 @@ typedef struct {
   void* check_handles[2];                                                     \
   void* idle_handles[2];                                                      \
   void* async_handles[2];                                                     \
-  void (*async_unused)(void);  /* TODO(bnoordhuis) Remove in libuv v2. */     \
+  void* io_uring;                                                             \
   uv__io_t async_io_watcher;                                                  \
   int async_wfd;                                                              \
   struct {                                                                    \
