@@ -27,11 +27,13 @@
 
 #include "uv.h"
 #include "internal.h"
+#include "idna.h"
 
 #include <errno.h>
 #include <stddef.h> /* NULL */
 #include <stdlib.h>
 #include <string.h>
+#include <net/if.h> /* if_indextoname() */
 
 /* EAI_* constants. */
 #include <netdb.h>
@@ -85,12 +87,14 @@ int uv__getaddrinfo_translate_error(int sys_err) {
   case EAI_SOCKTYPE: return UV_EAI_SOCKTYPE;
 #endif
 #if defined(EAI_SYSTEM)
-  case EAI_SYSTEM: return -errno;
+  case EAI_SYSTEM: return UV__ERR(errno);
 #endif
   }
   assert(!"unknown EAI_* error code");
   abort();
+#ifndef __SUNPRO_C
   return 0;  /* Pacify compiler. */
+#endif
 }
 
 
@@ -99,28 +103,24 @@ static void uv__getaddrinfo_work(struct uv__work* w) {
   int err;
 
   req = container_of(w, uv_getaddrinfo_t, work_req);
-  err = getaddrinfo(req->hostname, req->service, req->hints, &req->res);
+  err = getaddrinfo(req->hostname, req->service, req->hints, &req->addrinfo);
   req->retcode = uv__getaddrinfo_translate_error(err);
 }
 
 
 static void uv__getaddrinfo_done(struct uv__work* w, int status) {
   uv_getaddrinfo_t* req;
-  struct addrinfo *res;
 
   req = container_of(w, uv_getaddrinfo_t, work_req);
   uv__req_unregister(req->loop, req);
 
-  res = req->res;
-  req->res = NULL;
-
   /* See initialization in uv_getaddrinfo(). */
   if (req->hints)
-    free(req->hints);
+    uv__free(req->hints);
   else if (req->service)
-    free(req->service);
+    uv__free(req->service);
   else if (req->hostname)
-    free(req->hostname);
+    uv__free(req->hostname);
   else
     assert(0);
 
@@ -128,12 +128,13 @@ static void uv__getaddrinfo_done(struct uv__work* w, int status) {
   req->service = NULL;
   req->hostname = NULL;
 
-  if (status == -ECANCELED) {
+  if (status == UV_ECANCELED) {
     assert(req->retcode == 0);
     req->retcode = UV_EAI_CANCELED;
   }
 
-  req->cb(req, req->retcode, res);
+  if (req->cb)
+    req->cb(req, req->retcode, req->addrinfo);
 }
 
 
@@ -143,27 +144,45 @@ int uv_getaddrinfo(uv_loop_t* loop,
                    const char* hostname,
                    const char* service,
                    const struct addrinfo* hints) {
+  char hostname_ascii[256];
   size_t hostname_len;
   size_t service_len;
   size_t hints_len;
   size_t len;
   char* buf;
+  long rc;
 
-  if (req == NULL || cb == NULL || (hostname == NULL && service == NULL))
-    return -EINVAL;
+  if (req == NULL || (hostname == NULL && service == NULL))
+    return UV_EINVAL;
+
+  /* FIXME(bnoordhuis) IDNA does not seem to work z/OS,
+   * probably because it uses EBCDIC rather than ASCII.
+   */
+#ifdef __MVS__
+  (void) &hostname_ascii;
+#else
+  if (hostname != NULL) {
+    rc = uv__idna_toascii(hostname,
+                          hostname + strlen(hostname),
+                          hostname_ascii,
+                          hostname_ascii + sizeof(hostname_ascii));
+    if (rc < 0)
+      return rc;
+    hostname = hostname_ascii;
+  }
+#endif
 
   hostname_len = hostname ? strlen(hostname) + 1 : 0;
   service_len = service ? strlen(service) + 1 : 0;
   hints_len = hints ? sizeof(*hints) : 0;
-  buf = malloc(hostname_len + service_len + hints_len);
+  buf = uv__malloc(hostname_len + service_len + hints_len);
 
   if (buf == NULL)
-    return -ENOMEM;
+    return UV_ENOMEM;
 
   uv__req_init(loop, req, UV_GETADDRINFO);
-  req->loop = loop;
   req->cb = cb;
-  req->res = NULL;
+  req->addrinfo = NULL;
   req->hints = NULL;
   req->service = NULL;
   req->hostname = NULL;
@@ -185,16 +204,51 @@ int uv_getaddrinfo(uv_loop_t* loop,
   if (hostname)
     req->hostname = memcpy(buf + len, hostname, hostname_len);
 
-  uv__work_submit(loop,
-                  &req->work_req,
-                  uv__getaddrinfo_work,
-                  uv__getaddrinfo_done);
-
-  return 0;
+  if (cb) {
+    uv__work_submit(loop,
+                    &req->work_req,
+                    UV__WORK_SLOW_IO,
+                    uv__getaddrinfo_work,
+                    uv__getaddrinfo_done);
+    return 0;
+  } else {
+    uv__getaddrinfo_work(&req->work_req);
+    uv__getaddrinfo_done(&req->work_req, 0);
+    return req->retcode;
+  }
 }
 
 
 void uv_freeaddrinfo(struct addrinfo* ai) {
   if (ai)
     freeaddrinfo(ai);
+}
+
+
+int uv_if_indextoname(unsigned int ifindex, char* buffer, size_t* size) {
+  char ifname_buf[UV_IF_NAMESIZE];
+  size_t len;
+
+  if (buffer == NULL || size == NULL || *size == 0)
+    return UV_EINVAL;
+
+  if (if_indextoname(ifindex, ifname_buf) == NULL)
+    return UV__ERR(errno);
+
+  len = strnlen(ifname_buf, sizeof(ifname_buf));
+
+  if (*size <= len) {
+    *size = len + 1;
+    return UV_ENOBUFS;
+  }
+
+  memcpy(buffer, ifname_buf, len);
+  buffer[len] = '\0';
+  *size = len;
+
+  return 0;
+}
+
+int uv_if_indextoiid(unsigned int ifindex, char* buffer, size_t* size) {
+  return uv_if_indextoname(ifindex, buffer, size);
 }

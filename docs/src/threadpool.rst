@@ -5,14 +5,24 @@ Thread pool work scheduling
 ===========================
 
 libuv provides a threadpool which can be used to run user code and get notified
-in the loop thread. This thread pool is internally used to run all filesystem
+in the loop thread. This thread pool is internally used to run all file system
 operations, as well as getaddrinfo and getnameinfo requests.
 
 Its default size is 4, but it can be changed at startup time by setting the
 ``UV_THREADPOOL_SIZE`` environment variable to any value (the absolute maximum
-is 128).
+is 1024).
 
-The threadpool is global and shared across all event loops.
+.. versionchanged:: 1.30.0 the maximum UV_THREADPOOL_SIZE allowed was increased from 128 to 1024.
+
+The threadpool is global and shared across all event loops. When a particular
+function makes use of the threadpool (i.e. when using :c:func:`uv_queue_work`)
+libuv preallocates and initializes the maximum number of threads allowed by
+``UV_THREADPOOL_SIZE``. This causes a relatively minor memory overhead
+(~1MB for 128 threads) but increases the performance of threading at runtime.
+
+.. note::
+    Note that even though a global thread pool which is shared across all events
+    loops is used, the functions are not thread safe.
 
 
 Data types
@@ -36,11 +46,6 @@ Data types
 
 Public members
 ^^^^^^^^^^^^^^
-
-.. c:member:: uv_loop_t* uv_work_t.loop
-
-    Loop that started this request and where completion will be reported.
-    Readonly.
 
 .. seealso:: The :c:type:`uv_req_t` members also apply.
 

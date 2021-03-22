@@ -292,11 +292,51 @@ TEST_IMPL(timer_run_once) {
 }
 
 
+TEST_IMPL(timer_is_closing) {
+  uv_timer_t handle;
+
+  ASSERT(0 == uv_timer_init(uv_default_loop(), &handle));
+  uv_close((uv_handle_t *)&handle, NULL);
+
+  ASSERT(UV_EINVAL == uv_timer_start(&handle, never_cb, 100, 100));
+
+  MAKE_VALGRIND_HAPPY();
+  return 0;
+}
+
+
 TEST_IMPL(timer_null_callback) {
   uv_timer_t handle;
 
   ASSERT(0 == uv_timer_init(uv_default_loop(), &handle));
   ASSERT(UV_EINVAL == uv_timer_start(&handle, NULL, 100, 100));
+
+  MAKE_VALGRIND_HAPPY();
+  return 0;
+}
+
+
+static uint64_t timer_early_check_expected_time;
+
+
+static void timer_early_check_cb(uv_timer_t* handle) {
+  uint64_t hrtime = uv_hrtime() / 1000000;
+  ASSERT(hrtime >= timer_early_check_expected_time);
+}
+
+
+TEST_IMPL(timer_early_check) {
+  uv_timer_t timer_handle;
+  const uint64_t timeout_ms = 10;
+
+  timer_early_check_expected_time = uv_now(uv_default_loop()) + timeout_ms;
+
+  ASSERT(0 == uv_timer_init(uv_default_loop(), &timer_handle));
+  ASSERT(0 == uv_timer_start(&timer_handle, timer_early_check_cb, timeout_ms, 0));
+  ASSERT(0 == uv_run(uv_default_loop(), UV_RUN_DEFAULT));
+
+  uv_close((uv_handle_t*) &timer_handle, NULL);
+  ASSERT(0 == uv_run(uv_default_loop(), UV_RUN_DEFAULT));
 
   MAKE_VALGRIND_HAPPY();
   return 0;

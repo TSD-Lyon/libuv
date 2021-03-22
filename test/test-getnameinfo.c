@@ -44,7 +44,13 @@ static void getnameinfo_req(uv_getnameinfo_t* handle,
   ASSERT(service != NULL);
 }
 
+
 TEST_IMPL(getnameinfo_basic_ip4) {
+/* TODO(gengjiawen): Fix test on QEMU. */
+#if defined(__QEMU__)
+  RETURN_SKIP("Test does not currently work in QEMU");
+#endif
+
   int r;
 
   r = uv_ip4_addr(address_ip4, port, &addr4);
@@ -63,7 +69,34 @@ TEST_IMPL(getnameinfo_basic_ip4) {
   return 0;
 }
 
+
+TEST_IMPL(getnameinfo_basic_ip4_sync) {
+/* TODO(gengjiawen): Fix test on QEMU. */
+#if defined(__QEMU__)
+  RETURN_SKIP("Test does not currently work in QEMU");
+#endif
+
+  ASSERT(0 == uv_ip4_addr(address_ip4, port, &addr4));
+
+  ASSERT(0 == uv_getnameinfo(uv_default_loop(),
+                             &req,
+                             NULL,
+                             (const struct sockaddr*)&addr4,
+                             0));
+  ASSERT(req.host[0] != '\0');
+  ASSERT(req.service[0] != '\0');
+
+  MAKE_VALGRIND_HAPPY();
+  return 0;
+}
+
+
 TEST_IMPL(getnameinfo_basic_ip6) {
+/* TODO(gengjiawen): Fix test on QEMU. */
+#if defined(__QEMU__)
+  RETURN_SKIP("Test does not currently work in QEMU");
+#endif
+  
   int r;
 
   r = uv_ip6_addr(address_ip6, port, &addr6);

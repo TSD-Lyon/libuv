@@ -20,87 +20,59 @@
  */
 
 #include <assert.h>
-#include <errno.h>
 #include <limits.h>
-#include <malloc.h>
-#include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
-#if defined(_MSC_VER) || defined(__MINGW64_VERSION_MAJOR)
-#include <crtdbg.h>
-#endif
 
 #include "uv.h"
 #include "internal.h"
+#include "queue.h"
 #include "handle-inl.h"
+#include "heap-inl.h"
 #include "req-inl.h"
-
-
-static uv_loop_t default_loop_struct;
-static uv_loop_t* default_loop_ptr;
+#include "heap-inl.h"
 
 /* uv_once initialization guards */
 static uv_once_t uv_init_guard_ = UV_ONCE_INIT;
 
+static void* uv__loops[2];
+static uv_mutex_t uv__loops_lock;
 
-#if defined(_DEBUG) && (defined(_MSC_VER) || defined(__MINGW64_VERSION_MAJOR))
-/* Our crt debug report handler allows us to temporarily disable asserts
- * just for the current thread.
- */
+static void uv__loops_init(void) {
+  uv_mutex_init(&uv__loops_lock);
+  QUEUE_INIT(&uv__loops);
+}
 
-UV_THREAD_LOCAL int uv__crt_assert_enabled = TRUE;
+static void uv__loops_add(uv_loop_t* loop) {
+  uv_mutex_lock(&uv__loops_lock);
+  QUEUE_INSERT_TAIL(&uv__loops, &loop->loops_queue);
+  uv_mutex_unlock(&uv__loops_lock);
+}
 
-static int uv__crt_dbg_report_handler(int report_type, char *message, int *ret_val) {
-  if (uv__crt_assert_enabled || report_type != _CRT_ASSERT)
-    return FALSE;
+static void uv__loops_remove(uv_loop_t* loop) {
+  uv_mutex_lock(&uv__loops_lock);
+  QUEUE_REMOVE(&loop->loops_queue);
+  uv_mutex_unlock(&uv__loops_lock);
+}
 
-  if (ret_val) {
-    /* Set ret_val to 0 to continue with normal execution.
-     * Set ret_val to 1 to trigger a breakpoint.
-    */
+void uv__wake_all_loops() {
+  QUEUE* q;
 
-    if(IsDebuggerPresent())
-      *ret_val = 1;
-    else
-      *ret_val = 0;
+  uv_mutex_lock(&uv__loops_lock);
+  QUEUE_FOREACH(q, &uv__loops) {
+    uv_loop_t* loop = QUEUE_DATA(q, uv_loop_t, loops_queue);
+    if (loop->iocp != INVALID_HANDLE_VALUE)
+      PostQueuedCompletionStatus(loop->iocp, 0, 0, NULL);
   }
-
-  /* Don't call _CrtDbgReport. */
-  return TRUE;
+  uv_mutex_unlock(&uv__loops_lock);
 }
-#else
-UV_THREAD_LOCAL int uv__crt_assert_enabled = FALSE;
-#endif
-
-
-#if !defined(__MINGW32__) || __MSVCRT_VERSION__ >= 0x800
-static void uv__crt_invalid_parameter_handler(const wchar_t* expression,
-    const wchar_t* function, const wchar_t * file, unsigned int line,
-    uintptr_t reserved) {
-  /* No-op. */
-}
-#endif
-
 
 static void uv_init(void) {
   /* Tell Windows that we will handle critical errors. */
   SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX |
                SEM_NOOPENFILEERRORBOX);
 
-  /* Tell the CRT to not exit the application when an invalid parameter is
-   * passed. The main issue is that invalid FDs will trigger this behavior.
-   */
-#if !defined(__MINGW32__) || __MSVCRT_VERSION__ >= 0x800
-  _set_invalid_parameter_handler(uv__crt_invalid_parameter_handler);
-#endif
-
-  /* We also need to setup our debug report handler because some CRT
-   * functions (eg _get_osfhandle) raise an assert when called with invalid
-   * FDs even though they return the proper error code in the release build.
-   */
-#if defined(_DEBUG) && (defined(_MSC_VER) || defined(__MINGW64_VERSION_MAJOR))
-  _CrtSetReportHook(uv__crt_dbg_report_handler);
-#endif
+  /* Initialize tracking of all uv loops */
+  uv__loops_init();
 
   /* Fetch winapi function pointers. This must be done first because other
    * initialization code might need these function pointers to be loaded.
@@ -121,10 +93,27 @@ static void uv_init(void) {
 
   /* Initialize utilities */
   uv__util_init();
+
+  /* Initialize system wakeup detection */
+  uv__init_detect_system_wakeup();
+}
+
+
+/* The number of milliseconds in one second. */
+#define UV__MILLISEC 1000
+
+
+void uv_update_time(uv_loop_t* loop) {
+  uint64_t new_time = uv__hrtime(UV__MILLISEC);
+  assert(new_time >= loop->time);
+  loop->time = new_time;
 }
 
 
 int uv_loop_init(uv_loop_t* loop) {
+  uv__loop_internal_fields_t* lfields;
+  int err;
+
   /* Initialize libuv itself first */
   uv__once_init();
 
@@ -132,6 +121,15 @@ int uv_loop_init(uv_loop_t* loop) {
   loop->iocp = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, 0, 1);
   if (loop->iocp == NULL)
     return uv_translate_sys_error(GetLastError());
+
+  lfields = (uv__loop_internal_fields_t*) uv__calloc(1, sizeof(*lfields));
+  if (lfields == NULL)
+    return UV_ENOMEM;
+  loop->internal_fields = lfields;
+
+  err = uv_mutex_init(&lfields->loop_metrics.lock);
+  if (err)
+    goto fail_metrics_mutex_init;
 
   /* To prevent uninitialized memory access, loop->time must be initialized
    * to zero before calling uv_update_time for the first time.
@@ -141,41 +139,56 @@ int uv_loop_init(uv_loop_t* loop) {
 
   QUEUE_INIT(&loop->wq);
   QUEUE_INIT(&loop->handle_queue);
-  QUEUE_INIT(&loop->active_reqs);
+  loop->active_reqs.count = 0;
   loop->active_handles = 0;
 
   loop->pending_reqs_tail = NULL;
 
   loop->endgame_handles = NULL;
 
-  RB_INIT(&loop->timers);
+  heap_init((struct heap*) &loop->timer_heap);
+  loop->timer_counter = 0;
 
-  loop->check_handles = NULL;
-  loop->prepare_handles = NULL;
-  loop->idle_handles = NULL;
+  QUEUE_INIT(&loop->check_handles);
+  QUEUE_INIT(&loop->prepare_handles);
+  QUEUE_INIT(&loop->idle_handles);
 
-  loop->next_prepare_handle = NULL;
-  loop->next_check_handle = NULL;
-  loop->next_idle_handle = NULL;
+  QUEUE_INIT(&loop->async_handles);
+  UV_REQ_INIT(loop, &loop->async_req, UV_WAKEUP);
 
   memset(&loop->poll_peer_sockets, 0, sizeof loop->poll_peer_sockets);
 
-  loop->active_tcp_streams = 0;
-  loop->active_udp_streams = 0;
-
-  loop->timer_counter = 0;
   loop->stop_flag = 0;
 
-  if (uv_mutex_init(&loop->wq_mutex))
-    abort();
+  err = uv_mutex_init(&loop->wq_mutex);
+  if (err)
+    goto fail_mutex_init;
 
-  if (uv_async_init(loop, &loop->wq_async, uv__work_done))
-    abort();
+  err = uv_async_init(loop, &loop->wq_async, uv__work_done);
+  if (err)
+    goto fail_async_init;
 
   uv__handle_unref(&loop->wq_async);
-  loop->wq_async.flags |= UV__HANDLE_INTERNAL;
+  loop->wq_async.flags |= UV_HANDLE_INTERNAL;
+
+  QUEUE_INIT(&loop->loops_queue);
+  uv__loops_add(loop);
 
   return 0;
+
+fail_async_init:
+  uv_mutex_destroy(&loop->wq_mutex);
+
+fail_mutex_init:
+  uv_mutex_destroy(&lfields->loop_metrics.lock);
+
+fail_metrics_mutex_init:
+  uv__free(lfields);
+  loop->internal_fields = NULL;
+  CloseHandle(loop->iocp);
+  loop->iocp = INVALID_HANDLE_VALUE;
+
+  return err;
 }
 
 
@@ -184,23 +197,19 @@ void uv__once_init(void) {
 }
 
 
-uv_loop_t* uv_default_loop(void) {
-  if (default_loop_ptr != NULL)
-    return default_loop_ptr;
-
-  if (uv_loop_init(&default_loop_struct))
-    return NULL;
-
-  default_loop_ptr = &default_loop_struct;
-  return default_loop_ptr;
-}
-
-
-static void uv__loop_close(uv_loop_t* loop) {
+void uv__loop_close(uv_loop_t* loop) {
+  uv__loop_internal_fields_t* lfields;
   size_t i;
 
-  /* close the async handle without needing an extra loop iteration */
-  assert(!loop->wq_async.async_sent);
+  uv__loops_remove(loop);
+
+  /* Close the async handle without needing an extra loop iteration.
+   * We might have a pending message, but we're just going to destroy the IOCP
+   * soon, so we can just discard it now without the usual risk of a getting
+   * another notification from GetQueuedCompletionStatusEx after calling the
+   * close_cb (which we also skip defining). We'll assert later that queue was
+   * actually empty and all reqs handled. */
+  loop->wq_async.async_sent = 0;
   loop->wq_async.close_cb = NULL;
   uv__handle_closing(&loop->wq_async);
   uv__handle_close(&loop->wq_async);
@@ -217,68 +226,35 @@ static void uv__loop_close(uv_loop_t* loop) {
   uv_mutex_unlock(&loop->wq_mutex);
   uv_mutex_destroy(&loop->wq_mutex);
 
+  lfields = uv__get_internal_fields(loop);
+  uv_mutex_destroy(&lfields->loop_metrics.lock);
+  uv__free(lfields);
+  loop->internal_fields = NULL;
+
   CloseHandle(loop->iocp);
 }
 
 
-int uv_loop_close(uv_loop_t* loop) {
-  QUEUE* q;
-  uv_handle_t* h;
-  if (!QUEUE_EMPTY(&(loop)->active_reqs))
-    return UV_EBUSY;
-  QUEUE_FOREACH(q, &loop->handle_queue) {
-    h = QUEUE_DATA(q, uv_handle_t, handle_queue);
-    if (!(h->flags & UV__HANDLE_INTERNAL))
-      return UV_EBUSY;
-  }
-
-  uv__loop_close(loop);
-
-#ifndef NDEBUG
-  memset(loop, -1, sizeof(*loop));
-#endif
-  if (loop == default_loop_ptr)
-    default_loop_ptr = NULL;
-
-  return 0;
-}
-
-
-uv_loop_t* uv_loop_new(void) {
-  uv_loop_t* loop;
-
-  loop = (uv_loop_t*)malloc(sizeof(uv_loop_t));
-  if (loop == NULL) {
-    return NULL;
-  }
-
-  if (uv_loop_init(loop)) {
-    free(loop);
-    return NULL;
-  }
-
-  return loop;
-}
-
-
-void uv_loop_delete(uv_loop_t* loop) {
-  uv_loop_t* default_loop;
-  int err;
-  default_loop = default_loop_ptr;
-  err = uv_loop_close(loop);
-  assert(err == 0);
-  if (loop != default_loop)
-    free(loop);
-}
-
-
 int uv__loop_configure(uv_loop_t* loop, uv_loop_option option, va_list ap) {
+  uv__loop_internal_fields_t* lfields;
+
+  lfields = uv__get_internal_fields(loop);
+  if (option == UV_METRICS_IDLE_TIME) {
+    lfields->flags |= UV_METRICS_IDLE_TIME;
+    return 0;
+  }
+
   return UV_ENOSYS;
 }
 
 
-int uv_backend_fd(const uv_loop_t* loop) {
-  return -1;
+uv_os_fd_t uv_backend_fd(const uv_loop_t* loop) {
+  return loop->iocp;
+}
+
+
+int uv_loop_fork(uv_loop_t* loop) {
+  return UV_ENOSYS;
 }
 
 
@@ -295,86 +271,193 @@ int uv_backend_timeout(const uv_loop_t* loop) {
   if (loop->endgame_handles)
     return 0;
 
-  if (loop->idle_handles)
+  if (!QUEUE_EMPTY(&loop->idle_handles))
     return 0;
 
   return uv__next_timeout(loop);
 }
 
 
-static void uv_poll(uv_loop_t* loop, DWORD timeout) {
+static void uv__poll_wine(uv_loop_t* loop, int timeout) {
   DWORD bytes;
   ULONG_PTR key;
   OVERLAPPED* overlapped;
   uv_req_t* req;
+  int repeat;
+  uint64_t timeout_time;
+  uint64_t user_timeout;
+  int reset_timeout;
 
-  GetQueuedCompletionStatus(loop->iocp,
-                            &bytes,
-                            &key,
-                            &overlapped,
-                            timeout);
+  timeout_time = loop->time + timeout;
 
-  if (overlapped) {
-    /* Package was dequeued */
-    req = uv_overlapped_to_req(overlapped);
-    uv_insert_pending_req(loop, req);
+  if (uv__get_internal_fields(loop)->flags & UV_METRICS_IDLE_TIME) {
+    reset_timeout = 1;
+    user_timeout = timeout;
+    timeout = 0;
+  } else {
+    reset_timeout = 0;
+  }
 
-    /* Some time might have passed waiting for I/O,
-     * so update the loop time here.
+  for (repeat = 0; ; repeat++) {
+    /* Only need to set the provider_entry_time if timeout != 0. The function
+     * will return early if the loop isn't configured with UV_METRICS_IDLE_TIME.
      */
-    uv_update_time(loop);
-  } else if (GetLastError() != WAIT_TIMEOUT) {
-    /* Serious error */
-    uv_fatal_error(GetLastError(), "GetQueuedCompletionStatus");
-  } else if (timeout > 0) {
-    /* GetQueuedCompletionStatus can occasionally return a little early.
-     * Make sure that the desired timeout is reflected in the loop time.
+    if (timeout != 0)
+      uv__metrics_set_provider_entry_time(loop);
+
+    GetQueuedCompletionStatus(loop->iocp,
+                              &bytes,
+                              &key,
+                              &overlapped,
+                              timeout);
+
+    if (reset_timeout != 0) {
+      timeout = user_timeout;
+      reset_timeout = 0;
+    }
+
+    /* Placed here because on success the loop will break whether there is an
+     * empty package or not, or if GetQueuedCompletionStatus returned early then
+     * the timeout will be updated and the loop will run again. In either case
+     * the idle time will need to be updated.
      */
-    uv__time_forward(loop, timeout);
+    uv__metrics_update_idle_time(loop);
+
+    if (overlapped) {
+      /* Package was dequeued */
+      req = container_of(overlapped, uv_req_t, u.io.overlapped);
+      uv_insert_pending_req(loop, req);
+
+      /* Some time might have passed waiting for I/O,
+       * so update the loop time here.
+       */
+      uv_update_time(loop);
+    } else if (GetLastError() != WAIT_TIMEOUT) {
+      /* Serious error */
+      uv_fatal_error(GetLastError(), "GetQueuedCompletionStatus");
+    } else if (timeout > 0) {
+      /* GetQueuedCompletionStatus can occasionally return a little early.
+       * Make sure that the desired timeout target time is reached.
+       */
+      uv_update_time(loop);
+      if (timeout_time > loop->time) {
+        timeout = (DWORD)(timeout_time - loop->time);
+        /* The first call to GetQueuedCompletionStatus should return very
+         * close to the target time and the second should reach it, but
+         * this is not stated in the documentation. To make sure a busy
+         * loop cannot happen, the timeout is increased exponentially
+         * starting on the third round.
+         */
+        timeout += repeat ? (1 << (repeat - 1)) : 0;
+        continue;
+      }
+    }
+    break;
   }
 }
 
 
-static void uv_poll_ex(uv_loop_t* loop, DWORD timeout) {
+static void uv__poll(uv_loop_t* loop, int timeout) {
   BOOL success;
   uv_req_t* req;
   OVERLAPPED_ENTRY overlappeds[128];
   ULONG count;
   ULONG i;
+  int repeat;
+  uint64_t timeout_time;
+  BOOL gotwakeup = FALSE;
+  uint64_t user_timeout;
+  int reset_timeout;
 
-  success = pGetQueuedCompletionStatusEx(loop->iocp,
-                                         overlappeds,
-                                         ARRAY_SIZE(overlappeds),
-                                         &count,
-                                         timeout,
-                                         FALSE);
+  timeout_time = loop->time + timeout;
 
-  if (success) {
-    for (i = 0; i < count; i++) {
-      /* Package was dequeued */
-      req = uv_overlapped_to_req(overlappeds[i].lpOverlapped);
-      uv_insert_pending_req(loop, req);
+  if (uv__get_internal_fields(loop)->flags & UV_METRICS_IDLE_TIME) {
+    reset_timeout = 1;
+    user_timeout = timeout;
+    timeout = 0;
+  } else {
+    reset_timeout = 0;
+  }
+
+  for (repeat = 0; ; repeat++) {
+    /* Only need to set the provider_entry_time if timeout != 0. The function
+     * will return early if the loop isn't configured with UV_METRICS_IDLE_TIME.
+     */
+    if (timeout != 0)
+      uv__metrics_set_provider_entry_time(loop);
+
+    success = pGetQueuedCompletionStatusEx(loop->iocp,
+                                           overlappeds,
+                                           ARRAY_SIZE(overlappeds),
+                                           &count,
+                                           timeout,
+                                           FALSE);
+
+    if (reset_timeout != 0) {
+      timeout = user_timeout;
+      reset_timeout = 0;
     }
 
-    /* Some time might have passed waiting for I/O,
-     * so update the loop time here.
+    /* Placed here because on success the loop will break whether there is an
+     * empty package or not, or if GetQueuedCompletionStatus returned early then
+     * the timeout will be updated and the loop will run again. In either case
+     * the idle time will need to be updated.
      */
-    uv_update_time(loop);
-  } else if (GetLastError() != WAIT_TIMEOUT) {
-    /* Serious error */
-    uv_fatal_error(GetLastError(), "GetQueuedCompletionStatusEx");
-  } else if (timeout > 0) {
-    /* GetQueuedCompletionStatus can occasionally return a little early.
-     * Make sure that the desired timeout is reflected in the loop time.
-     */
-    uv__time_forward(loop, timeout);
+    uv__metrics_update_idle_time(loop);
+
+    if (success) {
+      for (i = 0; i < count; i++) {
+        /* Package was dequeued, but see if it is not a empty package
+         * meant only to wake us up.
+         */
+        if (overlappeds[i].lpOverlapped) {
+          req = container_of(overlappeds[i].lpOverlapped, uv_req_t, u.io.overlapped);
+          /* If multiple async handles were triggered we might end up with
+           * multiple UV_WAKEUP requests (IOCP completion events). They all
+           * share the same req however, so we need to be careful to only make
+           * it pending once.
+           */
+          if (req->type == UV_WAKEUP) {
+            if (gotwakeup)
+              continue;
+            gotwakeup = TRUE;
+          }
+          uv_insert_pending_req(loop, req);
+        }
+      }
+
+      /* Some time might have passed waiting for I/O,
+       * so update the loop time here.
+       */
+      uv_update_time(loop);
+    } else if (GetLastError() != WAIT_TIMEOUT) {
+      /* Serious error */
+      uv_fatal_error(GetLastError(), "GetQueuedCompletionStatusEx");
+    } else if (timeout > 0) {
+      /* GetQueuedCompletionStatus can occasionally return a little early.
+       * Make sure that the desired timeout target time is reached.
+       */
+      uv_update_time(loop);
+      if (timeout_time > loop->time) {
+        timeout = (DWORD)(timeout_time - loop->time);
+        /* The first call to GetQueuedCompletionStatus should return very
+         * close to the target time and the second should reach it, but
+         * this is not stated in the documentation. To make sure a busy
+         * loop cannot happen, the timeout is increased exponentially
+         * starting on the third round.
+         */
+        timeout += repeat ? (1 << (repeat - 1)) : 0;
+        continue;
+      }
+    }
+    break;
   }
 }
 
 
 static int uv__loop_alive(const uv_loop_t* loop) {
-  return loop->active_handles > 0 ||
-         !QUEUE_EMPTY(&loop->active_reqs) ||
+  return uv__has_active_handles(loop) ||
+         uv__has_active_reqs(loop) ||
          loop->endgame_handles != NULL;
 }
 
@@ -385,15 +468,9 @@ int uv_loop_alive(const uv_loop_t* loop) {
 
 
 int uv_run(uv_loop_t *loop, uv_run_mode mode) {
-  DWORD timeout;
+  int timeout;
   int r;
   int ran_pending;
-  void (*poll)(uv_loop_t* loop, DWORD timeout);
-
-  if (pGetQueuedCompletionStatusEx)
-    poll = &uv_poll_ex;
-  else
-    poll = &uv_poll;
 
   r = uv__loop_alive(loop);
   if (!r)
@@ -401,19 +478,31 @@ int uv_run(uv_loop_t *loop, uv_run_mode mode) {
 
   while (r != 0 && loop->stop_flag == 0) {
     uv_update_time(loop);
-    uv_process_timers(loop);
+    uv__run_timers(loop);
 
     ran_pending = uv_process_reqs(loop);
-    uv_idle_invoke(loop);
-    uv_prepare_invoke(loop);
+    uv__run_idle(loop);
+    uv__run_prepare(loop);
 
     timeout = 0;
     if ((mode == UV_RUN_ONCE && !ran_pending) || mode == UV_RUN_DEFAULT)
       timeout = uv_backend_timeout(loop);
 
-    (*poll)(loop, timeout);
+    if (timeout == -1)
+        timeout = INFINITE;
+    if (pGetQueuedCompletionStatusEx)
+      uv__poll(loop, timeout);
+    else
+      uv__poll_wine(loop, timeout);
 
-    uv_check_invoke(loop);
+    /* Run one final update on the provider_idle_time in case uv__poll*
+     * returned because the timeout expired, but no events were received. This
+     * call will be ignored if the provider_entry_time was either never set (if
+     * the timeout == 0) or was already updated b/c an event was received.
+     */
+    uv__metrics_update_idle_time(loop);
+
+    uv__run_check(loop);
     uv_process_endgames(loop);
 
     if (mode == UV_RUN_ONCE) {
@@ -425,7 +514,7 @@ int uv_run(uv_loop_t *loop, uv_run_mode mode) {
        * UV_RUN_NOWAIT makes no guarantees about progress so it's omitted from
        * the check.
        */
-      uv_process_timers(loop);
+      uv__run_timers(loop);
     }
 
     r = uv__loop_alive(loop);
@@ -502,6 +591,35 @@ int uv__socket_sockopt(uv_handle_t* handle, int optname, int* value) {
     r = setsockopt(socket, SOL_SOCKET, optname, (const char*) value, len);
 
   if (r == SOCKET_ERROR)
+    return uv_translate_sys_error(WSAGetLastError());
+
+  return 0;
+}
+
+
+int uv_cpumask_size(void) {
+  return (int)(sizeof(DWORD_PTR) * 8);
+}
+
+
+int uv__getsockpeername(const uv_handle_t* handle,
+                        uv__peersockfunc func,
+                        struct sockaddr* name,
+                        int* namelen,
+                        int delayed_error) {
+
+  int result;
+  uv_os_fd_t fd;
+
+  result = uv_fileno(handle, &fd);
+  if (result != 0)
+    return result;
+
+  if (delayed_error)
+    return uv_translate_sys_error(delayed_error);
+
+  result = func((SOCKET) fd, name, namelen);
+  if (result != 0)
     return uv_translate_sys_error(WSAGetLastError());
 
   return 0;

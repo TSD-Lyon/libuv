@@ -53,6 +53,7 @@ TEST_IMPL(pipe_close_stdout_read_stdin) {
   int pid;
   int fd[2];
   int status;
+  char buf;
   uv_pipe_t stdin_pipe;
 
   r = pipe(fd);
@@ -64,6 +65,9 @@ TEST_IMPL(pipe_close_stdout_read_stdin) {
      * The write side will be closed by the parent process.
     */
     close(fd[1]);
+    /* block until write end of pipe is closed */
+    r = read(fd[0], &buf, 1);
+    ASSERT(-1 <= r && r <= 1);
     close(0);
     r = dup(fd[0]);
     ASSERT(r != -1);
@@ -100,5 +104,9 @@ TEST_IMPL(pipe_close_stdout_read_stdin) {
   MAKE_VALGRIND_HAPPY();
   return 0;
 }
+
+#else
+
+typedef int file_has_no_tests; /* ISO C forbids an empty translation unit. */
 
 #endif /* ifndef _WIN32 */

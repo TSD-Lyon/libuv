@@ -21,14 +21,25 @@
 
 #include <errno.h>
 
-#ifndef _WIN32
+#ifdef _WIN32
 # include <fcntl.h>
+#else
 # include <sys/socket.h>
 # include <unistd.h>
 #endif
 
 #include "uv.h"
 #include "task.h"
+
+#ifdef __linux__
+# include <sys/epoll.h>
+#endif
+
+#ifdef UV_HAVE_KQUEUE
+# include <sys/types.h>
+# include <sys/event.h>
+# include <sys/time.h>
+#endif
 
 
 #define NUM_CLIENTS 5
@@ -50,7 +61,7 @@ typedef struct connection_context_s {
   size_t read, sent;
   int is_server_connection;
   int open_handles;
-  int got_fin, sent_fin;
+  int got_fin, sent_fin, got_disconnect;
   unsigned int events, delayed_events;
 } connection_context_t;
 
@@ -71,6 +82,9 @@ static int closed_connections = 0;
 static int valid_writable_wakeups = 0;
 static int spurious_writable_wakeups = 0;
 
+#if !defined(__sun) && !defined(_AIX) && !defined(__MVS__)
+static int disconnects = 0;
+#endif /* !__sun && !_AIX  && !__MVS__ */
 
 static int got_eagain(void) {
 #ifdef _WIN32
@@ -86,23 +100,7 @@ static int got_eagain(void) {
 }
 
 
-static void set_nonblocking(uv_os_sock_t sock) {
-  int r;
-#ifdef _WIN32
-  unsigned long on = 1;
-  r = ioctlsocket(sock, FIONBIO, &on);
-  ASSERT(r == 0);
-#else
-  int flags = fcntl(sock, F_GETFL, 0);
-  ASSERT(flags >= 0);
-  r = fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-  ASSERT(r >= 0);
-#endif
-}
-
-
-static uv_os_sock_t create_nonblocking_bound_socket(
-    struct sockaddr_in bind_addr) {
+static uv_os_sock_t create_bound_socket (struct sockaddr_in bind_addr) {
   uv_os_sock_t sock;
   int r;
 
@@ -112,8 +110,6 @@ static uv_os_sock_t create_nonblocking_bound_socket(
 #else
   ASSERT(sock >= 0);
 #endif
-
-  set_nonblocking(sock);
 
 #ifndef _WIN32
   {
@@ -138,7 +134,10 @@ static void close_socket(uv_os_sock_t sock) {
 #else
   r = close(sock);
 #endif
-  ASSERT(r == 0);
+  /* On FreeBSD close() can fail with ECONNRESET if the socket was shutdown by
+   * the peer before all pending data was delivered.
+   */
+  ASSERT(r == 0 || errno == ECONNRESET);
 }
 
 
@@ -159,8 +158,9 @@ static connection_context_t* create_connection_context(
   context->delayed_events = 0;
   context->got_fin = 0;
   context->sent_fin = 0;
+  context->got_disconnect = 0;
 
-  r = uv_poll_init_socket(uv_default_loop(), &context->poll_handle, sock);
+  r = uv_poll_init(uv_default_loop(), &context->poll_handle, sock);
   context->open_handles++;
   context->poll_handle.data = context;
   ASSERT(r == 0);
@@ -222,7 +222,10 @@ static void connection_poll_cb(uv_poll_t* handle, int status, int events) {
       case 1: {
         /* Read a couple of bytes. */
         static char buffer[74];
-        r = recv(context->sock, buffer, sizeof buffer, 0);
+
+        do
+          r = recv(context->sock, buffer, sizeof buffer, 0);
+        while (r == -1 && errno == EINTR);
         ASSERT(r >= 0);
 
         if (r > 0) {
@@ -240,12 +243,16 @@ static void connection_poll_cb(uv_poll_t* handle, int status, int events) {
       case 3: {
         /* Read until EAGAIN. */
         static char buffer[931];
-        r = recv(context->sock, buffer, sizeof buffer, 0);
-        ASSERT(r >= 0);
 
-        while (r > 0) {
+        for (;;) {
+          do
+            r = recv(context->sock, buffer, sizeof buffer, 0);
+          while (r == -1 && errno == EINTR);
+
+          if (r <= 0)
+            break;
+
           context->read += r;
-          r = recv(context->sock, buffer, sizeof buffer, 0);
         }
 
         if (r == 0) {
@@ -301,7 +308,9 @@ static void connection_poll_cb(uv_poll_t* handle, int status, int events) {
           int send_bytes = MIN(TRANSFER_BYTES - context->sent, sizeof buffer);
           ASSERT(send_bytes > 0);
 
-          r = send(context->sock, buffer, send_bytes, 0);
+          do
+            r = send(context->sock, buffer, send_bytes, 0);
+          while (r == -1 && errno == EINTR);
 
           if (r < 0) {
             ASSERT(got_eagain());
@@ -323,7 +332,9 @@ static void connection_poll_cb(uv_poll_t* handle, int status, int events) {
           int send_bytes = MIN(TRANSFER_BYTES - context->sent, sizeof buffer);
           ASSERT(send_bytes > 0);
 
-          r = send(context->sock, buffer, send_bytes, 0);
+          do
+            r = send(context->sock, buffer, send_bytes, 0);
+          while (r == -1 && errno == EINTR);
 
           if (r < 0) {
             ASSERT(got_eagain());
@@ -339,12 +350,18 @@ static void connection_poll_cb(uv_poll_t* handle, int status, int events) {
             send_bytes = MIN(TRANSFER_BYTES - context->sent, sizeof buffer);
             ASSERT(send_bytes > 0);
 
-            r = send(context->sock, buffer, send_bytes, 0);
+            do
+              r = send(context->sock, buffer, send_bytes, 0);
+            while (r == -1 && errno == EINTR);
+            ASSERT(r != 0);
 
-            if (r <= 0) break;
+            if (r < 0) {
+              ASSERT(got_eagain());
+              break;
+            }
+
             context->sent += r;
           }
-          ASSERT(r > 0 || got_eagain());
           break;
         }
 
@@ -391,8 +408,17 @@ static void connection_poll_cb(uv_poll_t* handle, int status, int events) {
       new_events &= ~UV_WRITABLE;
     }
   }
+#if !defined(__sun) && !defined(_AIX) && !defined(__MVS__)
+  if (events & UV_DISCONNECT) {
+    context->got_disconnect = 1;
+    ++disconnects;
+    new_events &= ~UV_DISCONNECT;
+  }
 
+  if (context->got_fin && context->sent_fin && context->got_disconnect) {
+#else /* __sun && _AIX  && __MVS__ */
   if (context->got_fin && context->sent_fin) {
+#endif /* !__sun && !_AIX && !__MVS__  */
     /* Sent and received FIN. Close and destroy context. */
     close_socket(context->sock);
     destroy_connection_context(context);
@@ -443,7 +469,7 @@ static server_context_t* create_server_context(
   context->sock = sock;
   context->connections = 0;
 
-  r = uv_poll_init_socket(uv_default_loop(), &context->poll_handle, sock);
+  r = uv_poll_init(uv_default_loop(), &context->poll_handle, sock);
   context->poll_handle.data = context;
   ASSERT(r == 0);
 
@@ -479,12 +505,10 @@ static void server_poll_cb(uv_poll_t* handle, int status, int events) {
   ASSERT(sock >= 0);
 #endif
 
-  set_nonblocking(sock);
-
   connection_context = create_connection_context(sock, 1);
-  connection_context->events = UV_READABLE | UV_WRITABLE;
+  connection_context->events = UV_READABLE | UV_WRITABLE | UV_DISCONNECT;
   r = uv_poll_start(&connection_context->poll_handle,
-                    UV_READABLE | UV_WRITABLE,
+                    UV_READABLE | UV_WRITABLE | UV_DISCONNECT,
                     connection_poll_cb);
   ASSERT(r == 0);
 
@@ -502,7 +526,7 @@ static void start_server(void) {
   int r;
 
   ASSERT(0 == uv_ip4_addr("127.0.0.1", TEST_PORT, &addr));
-  sock = create_nonblocking_bound_socket(addr);
+  sock = create_bound_socket(addr);
   context = create_server_context(sock);
 
   r = listen(sock, 100);
@@ -523,12 +547,12 @@ static void start_client(void) {
   ASSERT(0 == uv_ip4_addr("127.0.0.1", TEST_PORT, &server_addr));
   ASSERT(0 == uv_ip4_addr("0.0.0.0", 0, &addr));
 
-  sock = create_nonblocking_bound_socket(addr);
+  sock = create_bound_socket(addr);
   context = create_connection_context(sock, 0);
 
-  context->events = UV_READABLE | UV_WRITABLE;
+  context->events = UV_READABLE | UV_WRITABLE | UV_DISCONNECT;
   r = uv_poll_start(&context->poll_handle,
-                    UV_READABLE | UV_WRITABLE,
+                    UV_READABLE | UV_WRITABLE | UV_DISCONNECT,
                     connection_poll_cb);
   ASSERT(r == 0);
 
@@ -562,12 +586,26 @@ static void start_poll_test(void) {
          spurious_writable_wakeups > 20);
 
   ASSERT(closed_connections == NUM_CLIENTS * 2);
-
+#if !defined(__sun) && !defined(_AIX) && !defined(__MVS__)
+  ASSERT(disconnects == NUM_CLIENTS * 2);
+#endif
   MAKE_VALGRIND_HAPPY();
 }
 
-
+ 
+/* Issuing a shutdown() on IBM i PASE with parameter SHUT_WR
+ * also sends a normal close sequence to the partner program.
+ * This leads to timing issues and ECONNRESET failures in the
+ * test 'poll_duplex' and 'poll_unidirectional'.
+ * 
+ * https://www.ibm.com/support/knowledgecenter/en/ssw_ibm_i_74/apis/shutdn.htm
+ */
 TEST_IMPL(poll_duplex) {
+#if defined(NO_SELF_CONNECT)
+  RETURN_SKIP(NO_SELF_CONNECT);
+#elif defined(__PASE__)
+  RETURN_SKIP("API shutdown() may lead to timing issue on IBM i PASE");
+#endif
   test_mode = DUPLEX;
   start_poll_test();
   return 0;
@@ -575,7 +613,86 @@ TEST_IMPL(poll_duplex) {
 
 
 TEST_IMPL(poll_unidirectional) {
+#if defined(NO_SELF_CONNECT)
+  RETURN_SKIP(NO_SELF_CONNECT);
+#elif defined(__PASE__)
+  RETURN_SKIP("API shutdown() may lead to timing issue on IBM i PASE");
+#endif
   test_mode = UNIDIRECTIONAL;
   start_poll_test();
   return 0;
 }
+
+
+/* Windows won't let you open a directory so we open a file instead.
+ * OS X lets you poll a file so open the $PWD instead.  Both fail
+ * on Linux so it doesn't matter which one we pick.  Both succeed
+ * on FreeBSD, Solaris and AIX so skip the test on those platforms.
+ */
+TEST_IMPL(poll_bad_fdtype) {
+#if !defined(__DragonFly__) && !defined(__FreeBSD__) && !defined(__sun) && \
+    !defined(_AIX) && !defined(__MVS__) && !defined(__FreeBSD_kernel__) && \
+    !defined(__OpenBSD__) && !defined(__CYGWIN__) && !defined(__MSYS__) && \
+    !defined(__NetBSD__)
+  uv_poll_t poll_handle;
+  uv_os_fd_t handle;
+  int fd;
+
+#if defined(_WIN32)
+  fd = open("test/fixtures/empty_file", O_RDONLY);
+#else
+  fd = open(".", O_RDONLY);
+#endif
+  ASSERT(fd != -1);
+  handle = uv_get_osfhandle(fd);
+  ASSERT(0 != uv_poll_init(uv_default_loop(), &poll_handle, (uv_os_sock_t)handle)); /* bad cast on windows to allow passing an invalid SOCKET */
+  ASSERT(0 == close(fd));
+#endif
+
+  MAKE_VALGRIND_HAPPY();
+  return 0;
+}
+
+
+#ifdef __linux__
+TEST_IMPL(poll_nested_epoll) {
+  uv_poll_t poll_handle;
+  int fd;
+
+  fd = epoll_create(1);
+  ASSERT(fd != -1);
+
+  ASSERT(0 == uv_poll_init(uv_default_loop(), &poll_handle, fd));
+  ASSERT(0 == uv_poll_start(&poll_handle, UV_READABLE, (uv_poll_cb) abort));
+  ASSERT(0 != uv_run(uv_default_loop(), UV_RUN_NOWAIT));
+
+  uv_close((uv_handle_t*) &poll_handle, NULL);
+  ASSERT(0 == uv_run(uv_default_loop(), UV_RUN_DEFAULT));
+  ASSERT(0 == close(fd));
+
+  MAKE_VALGRIND_HAPPY();
+  return 0;
+}
+#endif  /* __linux__ */
+
+
+#ifdef UV_HAVE_KQUEUE
+TEST_IMPL(poll_nested_kqueue) {
+  uv_poll_t poll_handle;
+  int fd;
+
+  fd = kqueue();
+  ASSERT(fd != -1);
+
+  ASSERT(0 == uv_poll_init(uv_default_loop(), &poll_handle, fd));
+  ASSERT(0 == uv_poll_start(&poll_handle, UV_READABLE, (uv_poll_cb) abort));
+  ASSERT(0 != uv_run(uv_default_loop(), UV_RUN_NOWAIT));
+
+  uv_close((uv_handle_t*) &poll_handle, NULL);
+  ASSERT(0 == uv_run(uv_default_loop(), UV_RUN_DEFAULT));
+  ASSERT(0 == close(fd));
+
+  MAKE_VALGRIND_HAPPY();
+  return 0;
+}
+#endif  /* UV_HAVE_KQUEUE */
